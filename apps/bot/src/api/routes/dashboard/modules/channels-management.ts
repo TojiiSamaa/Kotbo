@@ -4,11 +4,21 @@ import { readStatsConfig } from '../../../../services/analytics/statsConfig.js';
 import { cache } from '../../../../utils/cache.js';
 import prisma from '../../../../utils/db.js';
 import { logger } from '../../../../utils/logger.js';
+import { RENAME_TIMEOUT_MS, settleWithin } from '../../../../utils/discord.js';
 import { getGuildName, json, pushAudit, readJsonBody } from '../../../shared.js';
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import { resolveGuildLocale } from '../../../../utils/i18n.js';
 import { honeypotChannelName, provisionHoneypotChannel } from '../../../../services/moderation/honeypotProvisioning.js';
+import {
+  CHANNEL_PATCHES,
+  MAX_ADDITIONAL_GENERATORS,
+  normalizeTempVoiceGeneratorsInput,
+  resolveReservationRoleId,
+  categoryTrustPatch,
+  normalizeTempVoicePolicy,
+} from '../../../../services/features/tempVoiceService.js';
 import { readWordStatsEnabled, startWordStatsBackfillIfTurnedOn, type ModuleRouteContext } from './_shared.js';
+import type { Prisma } from '@prisma/client';
 
 /**
  * Fonctionnalites qui se reglent salon par salon, et le champ de la guilde qui
@@ -455,12 +465,22 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
       });
 
       const discordGuild = client.guilds.cache.get(guildId);
+
+      // Serveur injoignable : ses salons ne sont pas en cache non plus. Conclure
+      // « ils n'existent plus » effacerait tout le registre alors que les salons
+      // sont bien vivants - plus rien ne les référencerait ensuite. Même règle
+      // que le balayage au démarrage.
+      if (!discordGuild || discordGuild.available === false) {
+        json(res, 200, []);
+        return true;
+      }
+
       const activeChannels = [];
 
       for (const dbChan of dbChannels) {
-        const channel = discordGuild?.channels.cache.get(dbChan.id);
+        const channel = discordGuild.channels.cache.get(dbChan.id);
         if (channel && channel.type === ChannelType.GuildVoice) {
-          const creatorMember = discordGuild ? await discordGuild.members.fetch(dbChan.creatorId).catch(() => null) : null;
+          const creatorMember = await discordGuild.members.fetch(dbChan.creatorId).catch(() => null);
           activeChannels.push({
             id: dbChan.id,
             name: channel.name,
@@ -509,12 +529,27 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
 
       // 1. Action Delete
       if (body?.action === 'DELETE') {
-        // Disconnect members
-        for (const [_, member] of channel.members) {
-          await member.voice.disconnect('Salon temporaire fermé via le dashboard.').catch(() => null);
+        const closedName = channel.name;
+
+        // Supprimer d'abord : Discord éjecte les occupants de lui-même, alors
+        // que les déconnecter laisse l'écouteur supprimer le salon avant nous.
+        // Discord avant la base : purger l'état sans savoir si la suppression a
+        // abouti laisserait un salon vivant que plus rien ne référence.
+        const deleted = await channel.delete('Fermé par le dashboard.').then(() => true).catch((err: unknown) => {
+          // Salon déjà disparu : le résultat voulu est atteint, l'état suit.
+          if ((err as { code?: number }).code === 10003) return true;
+          logger.warn('ChannelsManagementAPI', `Impossible de supprimer le salon ${channelId} :`, err);
+          return false;
+        });
+
+        if (!deleted) {
+          json(res, 409, { error: 'Discord a refusé la suppression du salon.' });
+          return true;
         }
-        await channel.delete('Fermé par le dashboard.').catch(() => null);
-        await prisma.tempVoiceChannel.delete({ where: { id: channelId } }).catch(() => null);
+
+        await prisma.tempVoiceChannel.delete({ where: { id: channelId } }).catch((err: unknown) => {
+          logger.error('ChannelsManagementAPI', `Impossible de supprimer la ligne du salon ${channelId} :`, err);
+        });
 
         // Also clean up from local memory cache
         const { tempChannels } = await import('../../../../events/tempVoice.js');
@@ -522,11 +557,11 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
 
         await pushAudit(guildId, {
           user: auditUser,
-          action: `Fermeture forcée du salon temporaire ${channel.name}`,
+          action: `Fermeture forcée du salon temporaire ${closedName}`,
           context: getGuildName(client, guildId),
           module: 'Gestion des salons',
           eventType: 'Manuel',
-          details: `Salon temporaire ${channel.name} (${channelId}) supprimé par l'administrateur.`,
+          details: `Salon temporaire ${closedName} (${channelId}) supprimé par l'administrateur.`,
           channelId: null
         });
 
@@ -539,47 +574,96 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
 
       if (body?.name !== undefined && body.name.trim() !== '') {
         const newName = body.name.trim();
-        await channel.setName(newName).catch(() => null);
+        // discord.js met l'instance en cache a jour des le retour de `setName` :
+        // relire `channel.name` ensuite donnerait le nouveau nom des deux cotes
+        // de la flèche, et l'audit ne dirait plus rien.
+        const formerName = channel.name;
+        // Discord n'accepte que deux renommages par tranche de dix minutes, et
+        // `@discordjs/rest` attend la fin de la fenêtre au lieu de rejeter :
+        // sans borne, la requête HTTP resterait ouverte plusieurs minutes et le
+        // navigateur abandonnerait avant d'avoir un verdict.
+        const renamed = await settleWithin(channel.setName(newName), RENAME_TIMEOUT_MS);
+
+        if (renamed.status === 'failed') {
+          logger.warn('ChannelsManagementAPI', `Impossible de renommer le salon ${channelId} :`, renamed.error);
+          json(res, 409, { error: "Discord a refusé le renommage du salon." });
+          return true;
+        }
+
+        if (renamed.status === 'pending') {
+          json(res, 202, {
+            ok: true,
+            message: "Discord n'a pas confirmé le renommage : un salon ne peut changer de nom que deux fois par tranche de dix minutes. Le nouveau nom s'appliquera peut-être d'ici quelques minutes.",
+          });
+          return true;
+        }
+
         await pushAudit(guildId, {
           user: auditUser,
-          action: `Renommer salon temporaire ${channel.name} -> ${newName}`,
+          action: `Renommer salon temporaire ${formerName} -> ${newName}`,
           context: getGuildName(client, guildId),
           module: 'Gestion des salons',
           eventType: 'Manuel',
-          details: `Renommé de ${channel.name} à ${newName}.`,
+          details: `Renommé de ${formerName} à ${newName}.`,
           channelId: null
         });
       }
 
       if (body?.roleId !== undefined) {
-        const newRoleId = body.roleId; // string | null
+        // Le corps de la requête part dans une surcharge : le rôle doit exister
+        // sur ce serveur et ne pas être @everyone, dont l'identifiant est celui
+        // du serveur et passe donc la validation de format.
+        const newRoleId = body.roleId
+          ? resolveReservationRoleId(body.roleId, guildId, new Set(channel.guild.roles.cache.keys()))
+          : null;
 
-        if (newRoleId) {
-          // Deny everyone connect
-          await channel.permissionOverwrites.edit(guildId, {
-            Connect: false
-          }).catch(() => null);
+        if (body.roleId && !newRoleId) {
+          json(res, 400, { error: 'Rôle de réservation invalide' });
+          return true;
+        }
 
-          // Allow creator
-          await channel.permissionOverwrites.edit(dbChan.creatorId, {
-            Connect: true,
-            ViewChannel: true,
-            Speak: true
-          }).catch(() => null);
+        // La catégorie fait foi : accorder sans la consulter ouvrirait le salon
+        // a une cible qu'elle refuse.
+        const rolePatch = newRoleId
+          ? categoryTrustPatch(channel, channel.guild.roles.cache.get(newRoleId) ?? null)
+          : null;
+        if (newRoleId && !rolePatch) {
+          json(res, 409, { error: "La catégorie du salon refuse l'accès à ce rôle" });
+          return true;
+        }
 
-          // Allow role
-          await channel.permissionOverwrites.edit(newRoleId, {
-            Connect: true,
-            ViewChannel: true,
-            Speak: true
-          }).catch(() => null);
+        // Sans ce retrait, les surcharges des rôles réservés s'accumulent, et
+        // son échec doit remonter : l'ancien rôle garde sinon l'accès.
+        let previousCleared = true;
+        if (dbChan.roleId && dbChan.roleId !== newRoleId) {
+          previousCleared = await channel.permissionOverwrites
+            .delete(dbChan.roleId, 'Réservation précédente levée')
+            .then(() => true)
+            .catch((err: unknown) => {
+              logger.warn('ChannelsManagementAPI', `Impossible de lever la réservation précédente sur ${channelId} :`, err);
+              return false;
+            });
+        }
+
+        if (newRoleId && rolePatch) {
+          // Le propriétaire n'est pas toujours en cache : le sauter le mettrait
+          // dehors du salon que le verrou ferme juste après.
+          const owner = channel.guild.members.cache.get(dbChan.creatorId)
+            ?? await channel.guild.members.fetch(dbChan.creatorId).catch(() => null);
+          const ownerPatch = categoryTrustPatch(channel, owner);
+
+          // Les autorisations d'abord, le verrou ensuite : dans l'ordre inverse,
+          // un appel refusé entre les deux laisse un salon fermé à tout le monde
+          // et sans réservation.
+          if (ownerPatch && owner) await channel.permissionOverwrites.edit(owner, ownerPatch);
+          await channel.permissionOverwrites.edit(newRoleId, rolePatch);
+          await channel.permissionOverwrites.edit(guildId, CHANNEL_PATCHES.lock);
 
           data.roleId = newRoleId;
         } else {
-          // Clear role connect restriction, revert back to general connect permission for everyone
-          await channel.permissionOverwrites.edit(guildId, {
-            Connect: true
-          }).catch(() => null);
+          // `null` et non `true` : rendre le droit a la catégorie sans écraser
+          // un refus pose plus haut, comme le fait le panneau Discord.
+          await channel.permissionOverwrites.edit(guildId, CHANNEL_PATCHES.clearReservation);
 
           data.roleId = null;
         }
@@ -598,12 +682,23 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
           details: newRoleId ? `Accès restreint au rôle ${newRoleId}.` : `Salon ouvert à tous.`,
           channelId: null
         });
+
+        // La surcharge du rôle précédent n'a pas pu être retirée : l'annoncer,
+        // plutôt que de laisser la page afficher une exclusivité qui n'existe
+        // pas.
+        if (!previousCleared) {
+          json(res, 200, {
+            ok: true,
+            message: "Salon mis à jour, mais la réservation précédente n'a pas pu être levée : l'ancien rôle garde l'accès.",
+          });
+          return true;
+        }
       }
 
       json(res, 200, { ok: true, message: 'Salon mis à jour avec succès.' });
     } catch (err) {
       logger.error('ChannelsManagementAPI', 'PATCH active channel error:', err);
-      json(res, 500, { error: 'Erreur lors du mise à jour du salon.' });
+      json(res, 500, { error: 'Erreur lors de la mise à jour du salon.' });
     }
     return true;
   }
@@ -625,6 +720,7 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
             tempVoiceCategoryId: true,
             tempVoiceNameTemplate: true,
             tempVoiceRequiredRoleId: true,
+            tempVoiceDefaults: true,
             tempVoiceGenerators: true,
             honeypotEnabled: true,
             honeypotChannelId: true,
@@ -648,7 +744,18 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
           tempVoiceCategoryId: guild.tempVoiceCategoryId,
           tempVoiceNameTemplate: guild.tempVoiceNameTemplate,
           tempVoiceRequiredRoleId: guild.tempVoiceRequiredRoleId,
-          tempVoiceGenerators: guild.tempVoiceGenerators,
+          // Toujours renvoyer une politique complète : la page n'a pas a
+          // connaître les valeurs par défaut ni à gérer le cas « jamais
+          // configuré », qui afficherait des cases vides au lieu de l'état réel.
+          tempVoiceDefaults: normalizeTempVoicePolicy(guild.tempVoiceDefaults, guildId),
+          // Même normalisation qu'à l'écriture, salon du principal compris : un
+          // générateur enregistré avant ce réglage n'a aucune clé de politique,
+          // et la page doit montrer ce que la sauvegarde gardera.
+          tempVoiceGenerators: normalizeTempVoiceGeneratorsInput(
+            guild.tempVoiceGenerators,
+            guildId,
+            guild.tempVoiceChannelId,
+          ),
           honeypotEnabled: guild.honeypotEnabled,
           honeypotChannelId: guild.honeypotChannelId,
           honeypotSanction: guild.honeypotSanction,
@@ -675,7 +782,8 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
           tempVoiceCategoryId?: string | null;
           tempVoiceNameTemplate?: string;
           tempVoiceRequiredRoleId?: string | null;
-          tempVoiceGenerators?: Array<{ channelId?: string; categoryId?: string; nameTemplate?: string; requiredRoleId?: string | null }>;
+          tempVoiceDefaults?: unknown;
+          tempVoiceGenerators?: unknown;
           honeypotEnabled?: boolean;
           /** Demande au dashboard de creer le salon piege automatiquement. */
           createHoneypotChannel?: boolean;
@@ -721,8 +829,18 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
         if (Object.prototype.hasOwnProperty.call(body, 'tempVoiceRequiredRoleId')) {
           data.tempVoiceRequiredRoleId = body.tempVoiceRequiredRoleId;
         }
+        if (Object.prototype.hasOwnProperty.call(body, 'tempVoiceDefaults')) {
+          data.tempVoiceDefaults = normalizeTempVoicePolicy(body.tempVoiceDefaults, guildId) as unknown as Prisma.InputJsonValue;
+        }
         if (Object.prototype.hasOwnProperty.call(body, 'tempVoiceGenerators')) {
-          data.tempVoiceGenerators = body.tempVoiceGenerators;
+          // La page n'est qu'un client parmi d'autres (outils MCP, appels
+          // directs) : sans validation ici, une limite de places aberrante ou un
+          // identifiant de rôle invente descendrait jusqu'à l'appel Discord.
+          data.tempVoiceGenerators = normalizeTempVoiceGeneratorsInput(
+            body.tempVoiceGenerators,
+            guildId,
+            body.tempVoiceChannelId,
+          ) as unknown as Prisma.InputJsonValue;
         }
         if (Object.prototype.hasOwnProperty.call(body, 'honeypotEnabled')) {
           data.honeypotEnabled = !!body.honeypotEnabled;
@@ -754,56 +872,101 @@ export async function handleChannelsManagementRoutes(ctx: ModuleRouteContext): P
 
         if (discordGuild) {
           if (body.tempVoiceEnabled) {
-            if (!body.tempVoiceCategoryId) {
+            // Catégorie d'accueil partagee par tous les générateurs qui n'en
+            // designent pas : une par générateur en laisserait autant que de
+            // sauvegardes.
+            const ensureDefaultCategory = async (): Promise<string | undefined> => {
               const existing = discordGuild.channels.cache.find(
                 c => c.type === ChannelType.GuildCategory && c.name === '🔊 Salons Vocaux'
               );
-              const cat = existing || await discordGuild.channels.create({
+              if (existing) return existing.id;
+              const created = await discordGuild.channels.create({
                 name: '🔊 Salons Vocaux',
                 type: ChannelType.GuildCategory,
               }).catch(() => null);
-              if (cat) data.tempVoiceCategoryId = cat.id;
+              return created?.id;
+            };
+
+            if (!body.tempVoiceCategoryId) {
+              const categoryId = await ensureDefaultCategory();
+              if (categoryId) data.tempVoiceCategoryId = categoryId;
             }
-            if (!body.tempVoiceChannelId) {
-              const parentId = (data.tempVoiceCategoryId as string | undefined) || body.tempVoiceCategoryId || undefined;
-              const newVoice = await discordGuild.channels.create({
+            // Salon générateur : réutilisé avant d'être créé, comme la
+            // catégorie juste au-dessus, sinon chaque sauvegarde en ajoute un.
+            const ensureGeneratorChannel = async (parentId: string | undefined): Promise<string | undefined> => {
+              const existing = discordGuild.channels.cache.find(
+                c => c.type === ChannelType.GuildVoice
+                  && c.name === '➕ Créer un salon'
+                  && (!parentId || c.parentId === parentId)
+              );
+              if (existing) return existing.id;
+              const created = await discordGuild.channels.create({
                 name: '➕ Créer un salon',
                 type: ChannelType.GuildVoice,
                 parent: parentId,
               }).catch(() => null);
-              if (newVoice) {
-                data.tempVoiceChannelId = newVoice.id;
-              }
+              return created?.id;
+            };
+
+            if (!body.tempVoiceChannelId) {
+              const parentId = (data.tempVoiceCategoryId as string | undefined) || body.tempVoiceCategoryId || undefined;
+              const channelId = await ensureGeneratorChannel(parentId);
+              if (channelId) data.tempVoiceChannelId = channelId;
             }
 
-            // Auto-create channels for additional generators
+            // Générateurs additionnels : la page peut laisser le salon vide
+            // pour demander au bot de le créer.
             if (Array.isArray(body.tempVoiceGenerators)) {
-              const resolvedGenerators = [];
-              for (const gen of body.tempVoiceGenerators) {
-                const resolved = { ...gen };
+              const resolvedGenerators: Array<Record<string, unknown>> = [];
+
+              // Le plafond s'applique AVANT la création : appliqué au seul
+              // enregistrement, il laisse créer autant de salons que d'entrées.
+              for (const entry of body.tempVoiceGenerators.slice(0, MAX_ADDITIONAL_GENERATORS)) {
+                if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+                const resolved: Record<string, unknown> = { ...(entry as Record<string, unknown>) };
 
                 if (!resolved.categoryId) {
-                  const cat = await discordGuild.channels.create({
-                    name: '🔊 Salons Vocaux',
-                    type: ChannelType.GuildCategory,
-                  }).catch(() => null);
-                  if (cat) resolved.categoryId = cat.id;
+                  const categoryId = await ensureDefaultCategory();
+                  if (categoryId) resolved.categoryId = categoryId;
                 }
 
                 if (!resolved.channelId) {
-                  const newVoice = await discordGuild.channels.create({
-                    name: '➕ Créer un salon',
-                    type: ChannelType.GuildVoice,
-                    parent: resolved.categoryId || undefined,
-                  }).catch(() => null);
-                  if (newVoice) resolved.channelId = newVoice.id;
+                  // Un générateur additionnel ne peut pas reprendre le salon du
+                  // principal : le dedoublonnage l'ecarterait ensuite.
+                  const parentId = typeof resolved.categoryId === 'string' ? resolved.categoryId : undefined;
+                  const alreadyUsed = new Set(
+                    [(data.tempVoiceChannelId as string | undefined) ?? body.tempVoiceChannelId, ...resolvedGenerators.map(g => g.channelId)]
+                      .filter((id): id is string => typeof id === 'string'),
+                  );
+                  const existing = discordGuild.channels.cache.find(
+                    c => c.type === ChannelType.GuildVoice
+                      && c.name === '➕ Créer un salon'
+                      && (!parentId || c.parentId === parentId)
+                      && !alreadyUsed.has(c.id)
+                  );
+                  if (existing) {
+                    resolved.channelId = existing.id;
+                  } else {
+                    const newVoice = await discordGuild.channels.create({
+                      name: '➕ Créer un salon',
+                      type: ChannelType.GuildVoice,
+                      parent: parentId,
+                    }).catch(() => null);
+                    if (newVoice) resolved.channelId = newVoice.id;
+                  }
                 }
 
-                if (resolved.channelId) {
-                  resolvedGenerators.push(resolved);
-                }
+                resolvedGenerators.push(resolved);
               }
-              data.tempVoiceGenerators = resolvedGenerators;
+
+              // La validation vient après la création, et non avant : un
+              // générateur que la page laisse vide pour que le bot le crée n'a
+              // pas encore d'identifiant, et serait écarté comme invalide.
+              data.tempVoiceGenerators = normalizeTempVoiceGeneratorsInput(
+                resolvedGenerators,
+                guildId,
+                (data.tempVoiceChannelId as string | undefined) ?? body.tempVoiceChannelId,
+              ) as unknown as Prisma.InputJsonValue;
             }
           }
 

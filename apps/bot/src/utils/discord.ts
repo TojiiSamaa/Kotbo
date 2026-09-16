@@ -57,3 +57,49 @@ export async function fetchAllMembers(guild: Guild): Promise<Collection<string, 
   
   return guild.members.cache;
 }
+
+/**
+ * Issue d'un appel Discord attendu avec une borne de temps.
+ *
+ * Les trois cas sont distincts : `done` (la requête a abouti), `failed`
+ * (Discord a refusé, et c'est définitif) et `pending` (pas de réponse dans le
+ * délai, mais la requête suit son cours). Les confondre fait annoncer une
+ * attente là où il y a un refus, ou l'inverse.
+ */
+export type Settled<T> = { status: 'done'; value: T } | { status: 'failed'; error: unknown } | { status: 'pending' };
+
+/**
+ * Attend un appel Discord sans s'y suspendre indéfiniment, et dit laquelle des
+ * trois issues s'est produite.
+ *
+ * Le dépôt compte déjà trois `withTimeout` locaux, qui rejettent, rendent `null`
+ * ou fabriquent un signal d'abandon : celui-ci porte un autre nom parce qu'il a
+ * un autre contrat - il ne tranche rien, il rapporte.
+ *
+ * `@discordjs/rest` ne rejette pas sur une limite de débit : `rejectOnRateLimit`
+ * n'étant pas configuré, il attend la fin de la fenêtre - jusqu'à plusieurs
+ * minutes pour un renommage de salon - puis rejoue la requête. Un `.catch` ne
+ * voit donc jamais ce cas : c'est l'interaction Discord, ou la requête HTTP du
+ * dashboard, qui expire en premier.
+ */
+export async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<Settled<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const pending = new Promise<Settled<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ status: 'pending' }), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({ status: 'done', value } as const),
+        (error: unknown) => ({ status: 'failed', error } as const),
+      ),
+      pending,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Au-delà, mieux vaut dire que Discord temporise que faire attendre. */
+export const RENAME_TIMEOUT_MS = 2_500;
