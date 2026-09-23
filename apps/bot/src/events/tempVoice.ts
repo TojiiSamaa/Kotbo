@@ -834,24 +834,40 @@ function resteEnClair(etat: EtatSalon): string {
   return `${etat.placesLibres} place${etat.placesLibres > 1 ? 's' : ''} libre${etat.placesLibres > 1 ? 's' : ''}`;
 }
 
+/** « 0 banni », « 2 bannis » : l'accord se fait, sinon la carte parle mal. */
+function compte(nombre: number, singulier: string, pluriel = `${singulier}s`): string {
+  return `${nombre} ${nombre > 1 ? pluriel : singulier}`;
+}
+
+/**
+ * La carte d'etat, en trois lignes.
+ *
+ * Elle en faisait quatorze sur telephone : six champs « inline » se replient en
+ * colonne unique des que l'ecran est etroit, et le panneau mangeait tout
+ * l'ecran pour six valeurs courtes. Deux d'entre eux — l'etat et les places —
+ * repetaient mot pour mot ce que le titre disait deja.
+ *
+ * Tout tient donc dans la description : les mentions y restent cliquables (un
+ * titre, lui, les afficherait en brut), rien ne se replie, et la hauteur est la
+ * meme sur ordinateur et sur telephone.
+ */
 function carteEtat(etat: EtatSalon): EmbedBuilder {
   const mode = LIBELLES_MODES_ECRITURE[etat.modeEcriture];
+  const places = `${I.profile} ${etat.occupants} / ${etat.limite > 0 ? etat.limite : '∞'}`;
+  const reserve = etat.reserveRoleId ? `${I.shield} <@&${etat.reserveRoleId}>` : `${I.shield} Non réservé`;
 
   return new EmbedBuilder()
     .setTitle(`${etat.verrouille ? I.lock : I.unlock} ${etat.verrouille ? 'Verrouillé' : 'Ouvert'} · ${resteEnClair(etat)}`)
     // Le ping va ici, jamais dans le titre : Discord n'interprète les mentions
     // ni dans un titre ni dans une ligne d'auteur, elles s'y afficheraient en
     // brut. Seules la description et la valeur d'un champ les rendent cliquables.
-    .setDescription(`${I.voice} Salon de <@${etat.proprietaireId}>`)
+    .setDescription([
+      `${I.voice} Salon de <@${etat.proprietaireId}>`,
+      '',
+      `${places} · ${iconeModeCarte(etat.modeEcriture)} ${mode.libelle}`,
+      `${I.check} ${compte(etat.autorises, 'autorisé')} · ${I.ban} ${compte(etat.bannis, 'banni')} · ${reserve}`,
+    ].join('\n'))
     .setColor(etat.verrouille ? COULEUR_FERME : COULEUR_OUVERT)
-    .addFields(
-      { name: 'État', value: `${etat.verrouille ? I.lock : I.unlock} ${etat.verrouille ? 'Verrouillé' : 'Ouvert'}`, inline: true },
-      { name: 'Places', value: `${I.profile} ${etat.occupants} / ${etat.limite > 0 ? etat.limite : '∞'}`, inline: true },
-      { name: 'Écriture', value: `${iconeModeCarte(etat.modeEcriture)} ${mode.libelle}`, inline: true },
-      { name: 'Autorisés', value: `${I.check} ${etat.autorises}`, inline: true },
-      { name: 'Bannis', value: `${I.ban} ${etat.bannis}`, inline: true },
-      { name: 'Réservé', value: etat.reserveRoleId ? `${I.shield} <@&${etat.reserveRoleId}>` : `${I.shield} Non`, inline: true },
-    )
     .setFooter({ text: 'Kotbo · Salon temporaire' })
     .setTimestamp();
 }
