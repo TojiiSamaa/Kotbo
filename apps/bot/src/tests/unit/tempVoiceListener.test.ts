@@ -146,6 +146,25 @@ function applyPatch(current: ReturnType<typeof fakeOverwrite>, patch: Record<str
  * `latencyMs` espace les écritures : sans délai, deux actions lancées ensemble
  * s'exécutent bout à bout et aucune course ne se produit.
  */
+/**
+ * Le texte d'une reponse du module, quelle que soit sa forme.
+ *
+ * `respond` passe par un embed : `editReply` n'est pas converti en composants
+ * V2 par `patchV2`, et un `content` brut sur un message deja en V2 fait rejeter
+ * l'edition par Discord. Un banc qui ne lirait que `content` mesurerait la
+ * forme au lieu du message.
+ */
+function texteDeLaReponse(charge: unknown): string {
+  const p = charge as {
+    content?: unknown;
+    embeds?: Array<{ data?: { description?: string }; description?: string }>;
+  } | undefined;
+  if (typeof p?.content === 'string' && p.content.length > 0) return p.content;
+  return (p?.embeds ?? [])
+    .map((embed) => embed?.data?.description ?? embed?.description ?? '')
+    .join(' ');
+}
+
 function fakeChannel(everyoneDeny = 0n, latencyMs = 0) {
   // Cibles qu'aucun des deux caches consultes par `upsert` - `roles.cache` puis
   // `users.cache` - ne saurait résoudre. Vide par defaut : tout ce que le module
@@ -767,8 +786,8 @@ describe('autorisation d\'un membre', () => {
       customId: 'tempvoice:trust_select', values: [OTHER],
       channel, member: fakeTarget(OWNER, false), guild,
     });
-    interaction.editReply = mock(async (p: { content: string }) => { messages.push(p.content); }) as never;
-    interaction.reply = mock(async (p: { content: string }) => { messages.push(p.content); }) as never;
+    interaction.editReply = mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }) as never;
+    interaction.reply = mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }) as never;
 
     await listeners.get(Events.InteractionCreate)?.(interaction);
     tempChannels.delete(CHANNEL);
@@ -1490,8 +1509,8 @@ describe('limite de places', () => {
       isRepliable: () => true,
       fields: { getTextInputValue: () => value },
       deferReply: mock(async () => { interaction.deferred = true; }),
-      reply: mock(async (p: { content: string }) => { messages.push(p.content); }),
-      editReply: mock(async (p: { content: string }) => { messages.push(p.content); }),
+      reply: mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }),
+      editReply: mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }),
       followUp: mock(async () => undefined),
     };
 
@@ -1867,8 +1886,8 @@ describe('renommage refusé', () => {
       isRepliable: () => true,
       fields: { getTextInputValue: () => 'Nouveau nom' },
       deferReply: mock(async () => { interaction.deferred = true; }),
-      reply: mock(async (p: { content: string }) => { messages.push(p.content); }),
-      editReply: mock(async (p: { content: string }) => { messages.push(p.content); }),
+      reply: mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }),
+      editReply: mock(async (p: unknown) => { messages.push(texteDeLaReponse(p)); }),
       followUp: mock(async () => undefined),
     };
 
@@ -2006,8 +2025,8 @@ describe('renommage', () => {
       isRepliable: () => true,
       fields: { getTextInputValue: () => 'Nouveau nom' },
       deferReply: mock(async () => { interaction.deferred = true; }),
-      reply: mock(async (payload: { content: string }) => { messages.push(payload.content); }),
-      editReply: mock(async (payload: { content: string }) => { messages.push(payload.content); }),
+      reply: mock(async (payload: unknown) => { messages.push(texteDeLaReponse(payload)); }),
+      editReply: mock(async (payload: unknown) => { messages.push(texteDeLaReponse(payload)); }),
       followUp: mock(async () => undefined),
     };
 
@@ -2728,8 +2747,14 @@ describe('Réécriture du panneau : anciens messages et composants V2', () => {
     registerTempVoiceListener(client);
     const guild = fakeGuild(new Map());
 
+    // Une action qui CHANGE l'etat : ouvrir un sous-panneau ne redessine rien,
+    // et c'est voulu - le panneau ne dit que ce qui a bouge.
     for (const salon of [salonAncien, salonV2]) {
-      const { interaction } = fakeButtonInteraction('salon', { channel: salon, guild, member: null });
+      const { interaction } = fakeButtonInteraction('bascule_verrou', {
+        channel: salon,
+        guild,
+        member: fakeTarget(OWNER, false),
+      });
       await listeners.get(Events.InteractionCreate)?.(interaction);
     }
 
@@ -2909,7 +2934,7 @@ describe('Vitesse de réécriture du panneau', () => {
     const { client, listeners } = fakeClient();
     registerTempVoiceListener(client);
 
-    const { interaction } = fakeButtonInteraction('salon', {
+    const { interaction } = fakeButtonInteraction('bascule_verrou', {
       channel,
       guild: fakeGuild(new Map()),
       member: fakeTarget(OWNER, false),
@@ -2931,7 +2956,7 @@ describe('Vitesse de réécriture du panneau', () => {
     const { client, listeners } = fakeClient();
     registerTempVoiceListener(client);
 
-    const { interaction } = fakeButtonInteraction('salon', {
+    const { interaction } = fakeButtonInteraction('bascule_verrou', {
       channel,
       guild: fakeGuild(new Map()),
       member: fakeTarget(OWNER, false),
@@ -2955,7 +2980,7 @@ describe('Vitesse de réécriture du panneau', () => {
     const guild = fakeGuild(new Map());
 
     for (let i = 0; i < 6; i += 1) {
-      const { interaction } = fakeButtonInteraction('salon', {
+      const { interaction } = fakeButtonInteraction('bascule_verrou', {
         channel,
         guild,
         member: fakeTarget(OWNER, false),
@@ -3433,6 +3458,58 @@ describe('Le bot ne se muselle pas lui-meme', () => {
     expect(edits.filter((e) => e.id === BOT_ID)).toHaveLength(0);
 
     tempChannels.delete(CHANNEL);
+    guildConfig = null;
+  }, 10_000);
+});
+
+describe('Verrouiller met a jour le panneau de base', () => {
+  test('le panneau public annonce « Verrouille » apres la bascule', async () => {
+    // Signale en conditions reelles : le sous-panneau passait bien en
+    // « Verrouille » et le panneau de base continuait d'afficher « Ouvert ».
+    guildConfig = { tempVoiceEnabled: true, baseStaffRoleId: null, moderatorRoleId: null, testStaffRoleId: null };
+
+    const { channel, syncFromGateway } = fakeChannel();
+    const panneau = {
+      id: '779000000000000001',
+      flags: { has: (drapeau: number) => drapeau === MessageFlags.IsComponentsV2 },
+      edit: mock(async () => undefined),
+      delete: mock(async () => undefined),
+    };
+    channel.id = '940000000000000001';
+    (channel as { messages?: unknown }).messages = { fetch: mock(async () => panneau) };
+
+    // La relecture forcee est le SEUL moyen de voir ce qu'on vient d'ecrire :
+    // `permissionOverwrites.edit` ne met pas le cache a jour.
+    (channel as { guild: Record<string, unknown> }).guild = {
+      id: GUILD,
+      roles: { everyone: { id: GUILD } },
+      channels: { fetch: mock(async () => { syncFromGateway(); return null; }) },
+      members: { me: { id: '600000000000000009', permissions: { has: () => true } } },
+    };
+    (channel as { permissionsFor?: unknown }).permissionsFor = () => ({ has: () => true });
+
+    const { client, listeners } = fakeClient();
+    registerTempVoiceListener(client);
+    tempChannels.set(channel.id, { creatorId: OWNER, panneauId: panneau.id });
+
+    const { interaction } = fakeButtonInteraction('bascule_verrou', {
+      channel,
+      guild: fakeGuild(new Map()),
+      member: fakeTarget(OWNER, false),
+    });
+    await listeners.get(Events.InteractionCreate)?.(interaction);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    // Le panneau de base a bien ete reecrit...
+    expect(panneau.edit).toHaveBeenCalled();
+
+    // ...et il dit l'etat REEL, pas celui d'avant le clic.
+    const appels = panneau.edit.mock.calls as unknown as unknown[][];
+    const rendu = JSON.stringify(appels.at(-1)?.[0] ?? {});
+    expect(rendu).toContain('Verrouill');
+    expect(rendu).not.toContain('Ouvert');
+
+    tempChannels.delete(channel.id);
     guildConfig = null;
   }, 10_000);
 });

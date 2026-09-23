@@ -1807,12 +1807,18 @@ export function registerTempVoiceListener(client: Client): void {
       demandes: await lireConfigDemandes(guildId),
     };
 
-    // Les panneaux déjà postés avant la refonte restent en place dans les salons
-    // vivants. Leurs identifiants de boutons continuent d'être acceptés (voir le
-    // `switch`), et la première interaction redessine le message : personne ne
-    // reste devant onze boutons qui ne disent pas l'état du salon.
-    planifierRafraichissementPanneau(channel);
-
+    // ⚠️ Aucun redessin ici. Il y en avait un, hérité de l'époque où
+    // l'anti-rebond n'avait pas de front montant : la réécriture arrivait deux
+    // secondes plus tard, donc après l'action, et lire l'état avant ne coûtait
+    // rien.
+    //
+    // Avec le front montant, ce même appel consomme la fenêtre sur l'état
+    // d'AVANT le clic — le panneau se redessinait identique, puis attendait la
+    // fermeture de la fenêtre pour dire la vérité. Verrouiller laissait donc
+    // « Ouvert » affiché.
+    //
+    // Chaque action qui change quelque chose appelle `planifierRafraichissement`
+    // une fois son travail fait : c'est là que le redessin a un sens.
     try {
       await handleTempVoiceAction({ interaction, action, channel, cache, guild, guildId, actingMember, ctxp });
     } catch (err) {
@@ -1921,12 +1927,23 @@ async function respond(
   retour?: OngletPanneau | null,
 ): Promise<void> {
   if (interaction.deferred || interaction.replied) {
-    // En mode compact, le verdict prend la place du menu qui l'a provoqué :
-    // laisser ce menu rendrait cliquable un sélecteur déjà consommé, et le
-    // bouton « Retour » est ce qui évite de rester devant une phrase sans issue.
-    const charge = retour
-      ? { content, components: [rangeeRetour(retour)], embeds: [] }
-      : { content };
+    // ⚠️ Le verdict part en EMBED, jamais en `content` brut.
+    //
+    // `editReply` n'est pas converti en composants V2 par `patchV2` : il ne
+    // connait pas le message cible et ne convertit que si la charge porte des
+    // embeds. Or ce message-la EST en V2 des qu'un sous-panneau l'a occupe, et
+    // Discord refuse alors tout `content`
+    // (`MESSAGE_CANNOT_USE_LEGACY_FIELDS_WITH_COMPONENTS_V2`, HTTP 400).
+    //
+    // Passer par un embed remet la charge sur le chemin qui la convertit : le
+    // texte devient un `TextDisplay`, le `content` disparait, et l'edition est
+    // acceptee.
+    const charge = {
+      embeds: [new EmbedBuilder().setColor(COULEUR_NEUTRE).setDescription(content)],
+      // Le menu qui a provoque le verdict est retire : un selecteur deja
+      // consomme ne doit pas rester cliquable.
+      components: retour ? [rangeeRetour(retour)] : [],
+    };
     await interaction.editReply(charge).catch(() => null);
     return;
   }
