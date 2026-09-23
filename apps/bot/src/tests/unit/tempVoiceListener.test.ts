@@ -3374,25 +3374,33 @@ describe('Limites de Discord : depassees, le message entier est rejete', () => {
     }
   }, 15_000);
 
-  test('aucun menu n est pose vide', async () => {
-    // Un menu sans option fait rejeter le message entier : la rangee doit
-    // disparaitre, pas se vider. Salon sans personne = cas reel.
-    for (const porte of ['salon', 'membres', 'propriete']) {
-      const rendu = await charge(porte, 0);
-      for (const rangee of rangeesDe(rendu)) {
-        for (const composant of rangee.composants) {
-          const c = composant as { data?: { custom_id?: string } };
-          // Un menu se reconnait a ce qu'il porte des options ailleurs.
-          const options = optionsDe(composant);
-          const estMenu = String(c.data?.custom_id ?? '').includes('select')
-            || String(c.data?.custom_id ?? '').includes('membre_ici');
-          if (estMenu && options.length === 0) {
-            // Les menus natifs (roles, membres) n'ont pas d'options : normal.
-            expect(String(c.data?.custom_id)).not.toContain('membre_ici');
-          }
-        }
-      }
-    }
+  test('un salon vide retire la rangee au lieu de poser un menu sans option', async () => {
+    // Un menu sans option fait rejeter le message ENTIER : la rangee doit
+    // disparaitre, pas se vider. Salon sans personne = cas reel, et c'est le
+    // seul menu du module dont les options sont calculees.
+    const rendu = await charge('membres', 0);
+
+    // D'abord la preuve que quelque chose a ete rendu : sans elle, un
+    // sous-panneau qui leve en se construisant ferait passer ce test a vide -
+    // exactement le piege paye sur le controle des plafonds.
+    expect(rendu).toBeDefined();
+    const rangees = rangeesDe(rendu);
+    expect(rangees.length).toBeGreaterThan(0);
+
+    const composants = rangees.flatMap((rangee) => rangee.composants);
+    const menuDesPresents = composants.find((composant) => {
+      const c = composant as { data?: { custom_id?: string } };
+      return c.data?.custom_id === 'tempvoice:membre_ici';
+    });
+
+    // La rangee des presents a disparu...
+    expect(menuDesPresents).toBeUndefined();
+    // ...et la recherche dans le serveur, elle, est toujours la.
+    const identifiants = composants.map((composant) => {
+      const c = composant as { data?: { custom_id?: string } };
+      return c.data?.custom_id ?? '';
+    });
+    expect(identifiants).toContain('tempvoice:membre_select');
   }, 15_000);
 });
 
@@ -3512,4 +3520,46 @@ describe('Verrouiller met a jour le panneau de base', () => {
     tempChannels.delete(channel.id);
     guildConfig = null;
   }, 10_000);
+});
+
+describe('Ephemeres : jamais de content brut', () => {
+  /**
+   * `patchV2` ne convertit une charge en composants V2 que si elle porte des
+   * embeds. Un message poste en `content` nait donc legacy, et la premiere
+   * edition qui portera un embed tentera de le convertir - ce que Discord
+   * refuse tant que le `content` est la (HTTP 400).
+   *
+   * Ce test verrouille la regle a l'endroit ou elle a ete enfreinte deux fois.
+   */
+  async function charge(action: string) {
+    guildConfig = { tempVoiceEnabled: true, baseStaffRoleId: null, moderatorRoleId: null, testStaffRoleId: null };
+    const { channel } = fakeChannel();
+    const { client, listeners } = fakeClient();
+    registerTempVoiceListener(client);
+    tempChannels.set(CHANNEL, { creatorId: OWNER });
+
+    const scene = fakeButtonInteraction(action, {
+      channel,
+      guild: fakeGuild(new Map()),
+      member: fakeTarget(OWNER, false),
+    });
+    await listeners.get(Events.InteractionCreate)?.(scene.interaction);
+
+    tempChannels.delete(CHANNEL);
+    guildConfig = null;
+
+    const appels = (scene.interaction.reply as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    return appels.map((appel) => appel[0] as { content?: unknown; embeds?: unknown[] } | undefined);
+  }
+
+  for (const action of ['reserve', 'kick', 'ban', 'trust']) {
+    test(`l invite « ${action} » porte un embed, jamais un content`, async () => {
+      const charges = await charge(action);
+      expect(charges.length).toBeGreaterThan(0);
+      for (const c of charges) {
+        expect(c?.content).toBeUndefined();
+        expect((c?.embeds ?? []).length).toBeGreaterThan(0);
+      }
+    }, 10_000);
+  }
 });

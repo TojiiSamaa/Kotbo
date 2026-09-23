@@ -1777,7 +1777,7 @@ export function registerTempVoiceListener(client: Client): void {
     const cache = tempChannels.get(channel.id);
     if (!cache) {
       await interaction
-        .reply({ content: "❌ Ce salon n'est plus enregistré comme temporaire.", flags: [MessageFlags.Ephemeral] })
+        .reply({ embeds: [avis("❌ Ce salon n'est plus enregistré comme temporaire.")], flags: [MessageFlags.Ephemeral] })
         .catch(() => null);
       return;
     }
@@ -1793,7 +1793,7 @@ export function registerTempVoiceListener(client: Client): void {
     // dehors. Les deux sont donc ouvertes à autrui.
     if (!ACTIONS_OUVERTES.has(action) && cache.creatorId !== user.id && !(await isStaff(guildId, actingMember))) {
       await interaction
-        .reply({ content: '❌ Seul le propriétaire du salon peut effectuer cette action.', flags: [MessageFlags.Ephemeral] })
+        .reply({ embeds: [avis('❌ Seul le propriétaire du salon peut effectuer cette action.')], flags: [MessageFlags.Ephemeral] })
         .catch(() => null);
       return;
     }
@@ -1823,7 +1823,7 @@ export function registerTempVoiceListener(client: Client): void {
       await handleTempVoiceAction({ interaction, action, channel, cache, guild, guildId, actingMember, ctxp });
     } catch (err) {
       logger.error('TempVoice', `Erreur lors de l'action « ${action} » :`, err);
-      const message = { content: "❌ L'action n'a pas pu être appliquée.", flags: [MessageFlags.Ephemeral] as const };
+      const message = { embeds: [avis("❌ L'action n'a pas pu être appliquée.")], flags: [MessageFlags.Ephemeral] as const };
       await (interaction.isRepliable() && (interaction.replied || interaction.deferred)
         ? interaction.followUp(message).catch(() => null)
         : interaction.reply(message).catch(() => null));
@@ -1921,6 +1921,22 @@ function rangeeRetour(onglet: OngletPanneau): ActionRowBuilder<MessageActionRowC
   );
 }
 
+/**
+ * Un éphémère de ce module, toujours sous la même forme.
+ *
+ * **Règle : jamais de `content` brut.** `patchV2` ne convertit une charge en
+ * composants V2 que si elle porte des embeds. Un message posté en `content` naît
+ * donc *legacy*, et la première édition qui, elle, portera un embed tentera de
+ * le convertir en V2 — ce que Discord refuse tant que le `content` est là
+ * (`MESSAGE_CANNOT_USE_LEGACY_FIELDS_WITH_COMPONENTS_V2`, HTTP 400).
+ *
+ * Tout passer par un embed met chaque message du module dans le même monde dès
+ * sa naissance, et rend toutes les éditions suivantes possibles.
+ */
+function avis(texte: string, couleur = COULEUR_NEUTRE): EmbedBuilder {
+  return new EmbedBuilder().setColor(couleur).setDescription(texte);
+}
+
 async function respond(
   interaction: RepliableInteraction,
   content: string,
@@ -1947,7 +1963,8 @@ async function respond(
     await interaction.editReply(charge).catch(() => null);
     return;
   }
-  await interaction.reply({ content, flags: [MessageFlags.Ephemeral] }).catch(() => null);
+  // Un embed, pas un `content` : voir la règle sur `avis`.
+  await interaction.reply({ embeds: [avis(content)], flags: [MessageFlags.Ephemeral] }).catch(() => null);
 }
 
 interface ActionContext {
@@ -2006,7 +2023,8 @@ async function acquitterMiseAJour(interaction: RepliableInteraction): Promise<vo
 
 /** Une réponse qui ne remplace pas le sous-panneau ouvert : elle s'ajoute à côté. */
 async function reponseSupplementaire(interaction: RepliableInteraction, texte: string): Promise<void> {
-  const message = { content: texte, flags: [MessageFlags.Ephemeral] as const };
+  // Un embed, pas un `content` : voir la regle sur `avis`.
+  const message = { embeds: [avis(texte)], flags: [MessageFlags.Ephemeral] as const };
   if (interaction.deferred || interaction.replied) {
     await interaction.followUp(message).catch(() => null);
     return;
@@ -2393,7 +2411,7 @@ async function appliquerDebordement(ctx: ActionContext, plan: PlanDebordement): 
 /** Referme la proposition : ses boutons ne doivent pas rester cliquables. */
 async function cloreProposition(interaction: RepliableInteraction, verdict: string): Promise<void> {
   if (!interaction.isMessageComponent()) return;
-  await interaction.update({ content: verdict, embeds: [], components: [] }).catch(() => null);
+  await interaction.update({ embeds: [avis(verdict)], components: [] }).catch(() => null);
 }
 
 /**
@@ -2450,7 +2468,7 @@ async function repondreDebordement(ctx: ActionContext, choix: 'deplacer' | 'deco
 async function cloreCarteDecision(interaction: RepliableInteraction, verdictAffiche: string): Promise<void> {
   if (!interaction.isMessageComponent()) return;
   await interaction.message
-    .edit({ components: [], content: verdictAffiche })
+    .edit({ components: [], embeds: [avis(verdictAffiche)] })
     .catch(() => null);
 }
 
@@ -3096,7 +3114,7 @@ async function handleTempVoiceAction(ctx: ActionContext): Promise<void> {
           return;
         }
         await interaction.reply({
-          content: labels[action] ?? 'Sélectionnez un membre.',
+          embeds: [avis(labels[action] ?? 'Sélectionnez un membre.')],
           components: [userPicker(`tempvoice:${action}_select`, 'Choisissez un membre')],
           ...ephemeral,
         });
@@ -3158,9 +3176,9 @@ async function handleTempVoiceAction(ctx: ActionContext): Promise<void> {
         }
 
         await interaction.reply({
-          content: reservationPosee
+          embeds: [avis(reservationPosee
             ? `🛡️ **Réserver le salon pour un rôle** :\nLe salon est réservé à <@&${reservationPosee}>. Décochez-le pour lever la réservation, ou choisissez un autre rôle.`
-            : '🛡️ **Réserver le salon pour un rôle** :\nSélectionnez le rôle qui sera autorisé à rejoindre votre salon vocal. Ne sélectionnez rien pour réinitialiser.',
+            : '🛡️ **Réserver le salon pour un rôle** :\nSélectionnez le rôle qui sera autorisé à rejoindre votre salon vocal. Ne sélectionnez rien pour réinitialiser.')],
           components: [new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(menuRole)],
           allowedMentions: { parse: [] },
           ...ephemeral,
