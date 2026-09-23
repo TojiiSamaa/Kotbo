@@ -790,6 +790,19 @@ async function retrouverPanneau(channel: VoiceChannel, entree: EntreeSalonTempor
   return null;
 }
 
+/**
+ * Un message posté avant que le dépôt ne passe aux composants V2 porte encore
+ * un `content`. Discord refuse d'éditer un tel message vers du V2 tant que ce
+ * `content` est là (`MESSAGE_CANNOT_USE_LEGACY_FIELDS_WITH_COMPONENTS_V2`), et
+ * la conversion globale de `patchV2` ne sait pas le retirer : elle traite le cas
+ * inverse, un message déjà V2 édité avec des champs anciens.
+ *
+ * Un panneau d'avant la refonte est donc remplacé plutôt que réécrit.
+ */
+function panneauEnV2(message: Message): boolean {
+  return Boolean(message.flags?.has?.(MessageFlags.IsComponentsV2));
+}
+
 async function reecrirePanneau(channel: VoiceChannel): Promise<void> {
   const entree = tempChannels.get(channel.id);
   if (!entree) return;
@@ -803,9 +816,45 @@ async function reecrirePanneau(channel: VoiceChannel): Promise<void> {
   await channel.guild?.channels?.fetch(channel.id, { force: true }).catch(() => null);
 
   const panneau = await construirePanneau(channel, entree);
+
+  if (!panneauEnV2(message)) {
+    await remplacerPanneauAncien(channel, entree, message, panneau);
+    return;
+  }
+
   await message.edit(panneau).catch((err: unknown) => {
     logger.warn('TempVoice', `Le panneau de ${channel.id} n'a pas pu être mis à jour :`, err);
   });
+}
+
+/**
+ * Le remplacement se fait dans cet ordre : supprimer, puis poster. L'inverse
+ * laisserait deux panneaux côte à côte si la suppression échouait, et
+ * `retrouverPanneau` prendrait le premier venu au passage suivant.
+ */
+async function remplacerPanneauAncien(
+  channel: VoiceChannel,
+  entree: EntreeSalonTemporaire,
+  ancien: Message,
+  panneau: PanneauRendu,
+): Promise<void> {
+  const supprime = await ancien.delete().then(() => true).catch((err: unknown) => {
+    logger.warn('TempVoice', `L'ancien panneau de ${channel.id} n'a pas pu être retiré :`, err);
+    return false;
+  });
+  // Échec de la suppression : on garde l'ancien panneau plutôt que d'en poster
+  // un second. Ses boutons répondent — leurs identifiants restent acceptés — et
+  // le passage suivant réessaiera.
+  if (!supprime) return;
+
+  entree.panneauId = undefined;
+  const poste = await channel
+    .send({ content: `<@${entree.creatorId}>`, ...panneau })
+    .catch((err: unknown) => {
+      logger.warn('TempVoice', `Le panneau de ${channel.id} n'a pas pu être reposté :`, err);
+      return null;
+    });
+  if (poste?.id) entree.panneauId = poste.id;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

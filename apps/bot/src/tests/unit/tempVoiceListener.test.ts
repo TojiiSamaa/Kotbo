@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, mock, setSystemTime, test } from 'bun:test';
 import path from 'node:path';
 import { completeModuleMock } from '../helpers/moduleMock.js';
-import { Events, PermissionFlagsBits, type Client } from 'discord.js';
+import { Events, MessageFlags, PermissionFlagsBits, type Client } from 'discord.js';
 import { MAX_USER_LIMIT } from '../../services/features/tempVoiceService.js';
 
 /**
@@ -2659,4 +2659,83 @@ describe('reprise des surcharges au démarrage', () => {
     expect(edits).toEqual([{ id: ABSENT, patch: { SendMessages: null } }]);
     tempChannels.delete(CHANNEL);
   });
+});
+
+describe('Réécriture du panneau : anciens messages et composants V2', () => {
+  /**
+   * Un panneau tel que Discord le rend : `flags.has()` dit s'il est déjà en
+   * composants V2. Un message posté avant ce passage porte encore un `content`,
+   * que Discord refuse de voir coexister avec des composants V2.
+   */
+  function fauxPanneau(estV2: boolean, supprimable = true) {
+    return {
+      id: '777000000000000001',
+      flags: { has: (drapeau: number) => estV2 && drapeau === MessageFlags.IsComponentsV2 },
+      edit: mock(async () => undefined),
+      delete: mock(async () => {
+        if (!supprimable) throw new Error('Missing Permissions');
+      }),
+    };
+  }
+
+  /** Un salon temporaire vivant dont le panneau est déjà connu. */
+  function salonAvecPanneau(id: string, panneau: ReturnType<typeof fauxPanneau>) {
+    const { channel } = fakeChannel();
+    channel.id = id;
+    (channel as { guild: Record<string, unknown> }).guild = {
+      id: GUILD,
+      roles: { everyone: { id: GUILD } },
+      channels: { fetch: mock(async () => null) },
+    };
+    (channel as { messages?: unknown }).messages = { fetch: mock(async () => panneau) };
+    tempChannels.set(id, { creatorId: OWNER, panneauId: panneau.id });
+    return channel;
+  }
+
+  test('un panneau d\'avant les composants V2 est remplacé, jamais édité', async () => {
+    // Discord refuse `MESSAGE_CANNOT_USE_LEGACY_FIELDS_WITH_COMPONENTS_V2` :
+    // un message qui porte encore un `content` ne peut pas être édité vers du
+    // V2, et la conversion globale du dépôt ne traite que le cas inverse. Vu
+    // en staging sur un salon dont le panneau datait d'avant la refonte.
+    const ancien = fauxPanneau(false);
+    const dejaV2 = fauxPanneau(true);
+    const recalcitrant = fauxPanneau(false, false);
+
+    const salonAncien = salonAvecPanneau('910000000000000001', ancien);
+    const salonV2 = salonAvecPanneau('910000000000000002', dejaV2);
+    const salonBloque = salonAvecPanneau('910000000000000003', recalcitrant);
+
+    const { client, listeners } = fakeClient();
+    registerTempVoiceListener(client);
+    const guild = fakeGuild(new Map());
+
+    // N'importe quelle interaction programme la réécriture : les trois
+    // minuteurs courent ensemble, une seule attente les couvre.
+    for (const salon of [salonAncien, salonV2, salonBloque]) {
+      const { interaction } = fakeButtonInteraction('salon', { channel: salon, guild, member: null });
+      await listeners.get(Events.InteractionCreate)?.(interaction);
+    }
+
+    // L'anti-rebond est de 2 s : c'est le vrai chemin, minuteur compris.
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
+
+    // 1. L'ancien panneau part et un neuf le remplace.
+    expect(ancien.delete).toHaveBeenCalled();
+    expect(ancien.edit).not.toHaveBeenCalled();
+    expect(salonAncien.send).toHaveBeenCalledTimes(1);
+
+    // 2. Un panneau déjà en V2 se contente d'une édition.
+    expect(dejaV2.edit).toHaveBeenCalled();
+    expect(dejaV2.delete).not.toHaveBeenCalled();
+    expect(salonV2.send).not.toHaveBeenCalled();
+
+    // 3. Suppression refusée : surtout ne pas poster un second panneau à côté
+    // du premier - `retrouverPanneau` prendrait ensuite le premier venu.
+    expect(recalcitrant.delete).toHaveBeenCalled();
+    expect(salonBloque.send).not.toHaveBeenCalled();
+
+    for (const id of ['910000000000000001', '910000000000000002', '910000000000000003']) {
+      tempChannels.delete(id);
+    }
+  }, 10_000);
 });
