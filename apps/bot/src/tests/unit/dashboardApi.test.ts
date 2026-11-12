@@ -1394,7 +1394,9 @@ async function adminRequest(method: string, url: string, body?: unknown) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const res = createMockResponse();
-  await handleAdminRoutes(req, res, splitPath(url), new URL(url, 'http://localhost'), mockClient);
+  // Comme dashboardApi.ts : le chemin est découpé sans la query string.
+  const target = new URL(url, 'http://localhost');
+  await handleAdminRoutes(req, res, splitPath(target.pathname), target, mockClient);
   return res;
 }
 

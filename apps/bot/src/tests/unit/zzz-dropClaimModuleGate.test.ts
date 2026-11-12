@@ -74,7 +74,17 @@ function mockerModule(relatif: string, overrides: Record<string, unknown>): void
 }
 
 mockerModule('../../utils/db', { default: fauxPrisma, prisma: fauxPrisma, prismaRead: fauxPrisma });
-mockerModule('../../utils/i18n', { resolveGuildLocale: mock(async () => 'fr') });
+// `dropService` charge `commands.ts` (clanService -> api/shared -> guildState), dont chaque
+// commande lit ses métadonnées à l'import : même forme que le vrai `getCommandMetadata`.
+mockerModule('../../utils/i18n', {
+  resolveGuildLocale: mock(async () => 'fr'),
+  getCommandMetadata: (keyPrefix: string) => ({
+    name: keyPrefix.toLowerCase(),
+    nameLocalizations: { fr: keyPrefix.toLowerCase() },
+    description: 'No description',
+    descriptionLocalizations: { fr: 'Pas de description' },
+  }),
+});
 mockerModule('../../services/core/moduleGate', {
   isModuleEnabled: mock(async (_guildId: string, moduleKey: string) => moduleKey !== 'leveling' || levelingActif),
 });
